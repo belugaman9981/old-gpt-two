@@ -1,4 +1,4 @@
-"""old_gpt v2.0 - a tiny GPT that trains on your own text AND keeps learning.
+"""old_gpt v2.0 - a tiny GPT that trains on your own text AND keeps learning. 
 
 What's new vs v1 (character-level, 3M params, CPU only):
   * Byte-level tokens (vocab 256): any text/language works, nothing is ever "unknown",
