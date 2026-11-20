@@ -154,6 +154,42 @@ class LearningTests(unittest.TestCase):
             self.assertEqual(gpt.load_ckpt(path, "cpu")[2]["lesson_texts"],
                              ["first lesson", "second lesson"])
 
+    def test_lesson_management_and_experiment_history(self):
+        cfg = dict(block=4, n_embd=8, n_head=2, n_layer=1, dropout=0.0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "model.pt")
+            meta = {
+                "steps": 0,
+                "learned": [],
+                "lesson_texts": ["first lesson", "second lesson"],
+            }
+            gpt.save_ckpt(path, gpt.GPT(cfg), cfg, meta)
+            result = dict(b_new=1.0, a_new=0.8, b_old=1.1, a_old=1.2,
+                          reverted=False)
+            gpt.record_experiment(meta, result, 100, 0.0002, 16, 0.5, 0.25, "learn")
+            gpt.save_ckpt(path, gpt.GPT(cfg), cfg, meta)
+
+            remove_args = SimpleNamespace(device="cpu", ckpt=path, remove=1, clear=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                gpt.cmd_lessons(remove_args)
+            saved_meta = gpt.load_ckpt(path, "cpu")[2]
+            self.assertEqual(saved_meta["lesson_texts"], ["second lesson"])
+
+            history_output = io.StringIO()
+            with contextlib.redirect_stdout(history_output):
+                gpt.print_history(saved_meta)
+            self.assertIn("accepted", history_output.getvalue())
+            self.assertIn("1 learning run", history_output.getvalue())
+
+    def test_experiment_history_is_capped(self):
+        meta = {"experiments": []}
+        result = dict(b_new=1.0, a_new=0.8, b_old=None, a_old=None,
+                      reverted=False)
+        for i in range(105):
+            gpt.record_experiment(meta, result, i, 0.0002, 16, 0.5, 0.25, "learn")
+        self.assertEqual(len(meta["experiments"]), 100)
+        self.assertEqual(meta["experiments"][0]["iters"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()

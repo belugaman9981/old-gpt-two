@@ -21,3 +21,9 @@ if you save. Checkpoint backups and rollback include the lesson history.
 Older checkpoints do not contain lesson text, so past lessons cannot be
 replayed unless taught again. Treat checkpoints and their backups as containing
 your lesson text. `train --resume` still trains on the data directory only.
+
+Use `python old-gpt.py lessons` to list saved lessons. Remove one with
+`python old-gpt.py lessons --remove N`, or clear all with
+`python old-gpt.py lessons --clear`. In chat, use `/lessons`, `/forget N`, and
+`/history`. The most recent 100 learning runs are retained in checkpoint
+metadata; they include settings and before/after loss values.

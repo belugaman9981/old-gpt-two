@@ -445,6 +445,58 @@ def replay_corpus(data, meta, block):
     return ReplayCorpus(data, texts, block) if data is not None or texts else None
 
 
+def lesson_summary(text, limit=70):
+    one_line = " ".join(text.split())
+    return one_line if len(one_line) <= limit else one_line[:limit - 3] + "..."
+
+
+def print_lessons(meta):
+    lessons = meta.get("lesson_texts", [])
+    if not lessons:
+        print("No saved lessons.")
+        return
+    print(f"{len(lessons)} saved lesson(s):")
+    for i, text in enumerate(lessons, 1):
+        print(f"  {i}. {lesson_summary(text)}")
+
+
+def print_history(meta):
+    history = meta.get("experiments", [])
+    if not history:
+        print("No learning history.")
+        return
+    print(f"{len(history)} learning run(s):")
+    for i, entry in enumerate(history, 1):
+        status = "reverted" if entry["reverted"] else "accepted"
+        print(
+            f"  {i}. {entry['timestamp']} | {status} | {entry['iters']} iters "
+            f"| lr {entry['lr']:.1e} | new {entry['new_frac']:.2f} "
+            f"| new loss {entry['b_new']:.3f}->{entry['a_new']:.3f}"
+            f"| old loss "
+            f"{'-' if entry['b_old'] is None else f'{entry['b_old']:.3f}->{entry['a_old']:.3f}'}"
+        )
+
+
+def record_experiment(meta, r, iters, lr, bs, new_frac, max_forget, source):
+    entry = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+        "iters": iters,
+        "lr": lr,
+        "batch": bs,
+        "new_frac": new_frac,
+        "max_forget": max_forget,
+        "reverted": r["reverted"],
+        "b_new": r["b_new"],
+        "a_new": r["a_new"],
+        "b_old": r["b_old"],
+        "a_old": r["a_old"],
+    }
+    meta.setdefault("experiments", []).append(entry)
+    if len(meta["experiments"]) > 100:
+        meta["experiments"] = meta["experiments"][-100:]
+
+
 # ----------------------------------------------------------------------------- commands
 
 
@@ -513,6 +565,7 @@ def cmd_learn(a):
         print("warning: no replay data or saved lessons - the model may forget what it knew.")
     r = learn(model, encode(text), old, cfg, dev, a.iters, a.lr, a.batch, a.new_frac, a.max_forget, a.force)
     print(report(r, a.max_forget))
+    record_experiment(meta, r, a.iters, a.lr, a.batch, a.new_frac, a.max_forget, "learn")
     if r["reverted"]:
         return
     meta["learned"] = meta.get("learned", []) + [(a.files or ["--text"])[0]]
@@ -530,6 +583,9 @@ def cmd_chat(a):
     print("Type a prompt and I'll continue it.\n"
           "  /teach <text or @file>   learn something new right now (replays old data to avoid forgetting)\n"
           "  /temp 0.7                change sampling temperature\n"
+          "  /lessons                 list saved lessons\n"
+          "  /forget N                remove lesson N and replay history\n"
+          "  /history                 show learning runs\n"
           "  /save                    keep what I learned    /quit  exit")
     while True:
         try:
@@ -552,6 +608,24 @@ def cmd_chat(a):
                 save_ckpt(a.ckpt, model, cfg, meta)
                 dirty = False
                 print("saved.")
+            elif cmd == "lessons":
+                print_lessons(meta)
+            elif cmd == "history":
+                print_history(meta)
+            elif cmd == "forget":
+                try:
+                    index = int(rest)
+                except ValueError:
+                    print("usage: /forget N")
+                    continue
+                lessons = meta.get("lesson_texts", [])
+                if index < 1 or index > len(lessons):
+                    print(f"lesson number must be between 1 and {len(lessons)}")
+                    continue
+                removed = lessons.pop(index - 1)
+                old = replay_corpus(try_old_corpus(a, cfg["block"]), meta, cfg["block"])
+                dirty = True
+                print(f"removed lesson {index}: {lesson_summary(removed)}")
             elif cmd == "teach" and rest:
                 text = clean(open(rest[1:], encoding="utf-8", errors="ignore").read()) if rest.startswith("@") else rest
                 if not text.strip():
@@ -560,6 +634,8 @@ def cmd_chat(a):
                 r = learn(model, encode(text), old, cfg, dev, iters=a.teach_iters, lr=a.lr,
                           bs=16, new_frac=a.new_frac, max_forget=a.max_forget)
                 print(report(r, a.max_forget))
+                record_experiment(meta, r, a.teach_iters, a.lr, 16, a.new_frac,
+                                  a.max_forget, "chat")
                 if not r["reverted"]:
                     meta.setdefault("lesson_texts", []).append(text)
                     if old is None:
@@ -567,7 +643,8 @@ def cmd_chat(a):
                     old.add(text)
                     dirty = True
             else:
-                print("commands: /teach <text|@file>, /temp N, /save, /quit")
+                print("commands: /teach <text|@file>, /temp N, /lessons, /forget N, "
+                      "/history, /save, /quit")
         else:
             print(sample(model, line, dev, a.n, temp, a.top_k, a.top_p))
     if dirty and input("Save what I learned this session? [y/N] ").strip().lower() == "y":
@@ -581,6 +658,32 @@ def cmd_rollback(a):
         sys.exit("No .prev backup to roll back to.")
     shutil.copyfile(prev, a.ckpt)
     print(f"restored {a.ckpt} from {prev}")
+
+
+def cmd_lessons(a):
+    dev = pick_device(a.device)
+    model, cfg, meta = load_ckpt(a.ckpt, dev)
+    lessons = meta.setdefault("lesson_texts", [])
+    if not a.remove and not a.clear:
+        print_lessons(meta)
+        return
+    if a.clear:
+        removed = len(lessons)
+        lessons.clear()
+        save_ckpt(a.ckpt, model, cfg, meta)
+        print(f"removed all {removed} saved lesson(s).")
+        return
+    if a.remove < 1 or a.remove > len(lessons):
+        sys.exit(f"lesson number must be between 1 and {len(lessons)}")
+    removed = lessons.pop(a.remove - 1)
+    save_ckpt(a.ckpt, model, cfg, meta)
+    print(f"removed lesson {a.remove}: {lesson_summary(removed)}")
+
+
+def cmd_history(a):
+    dev = pick_device(a.device)
+    _, _, meta = load_ckpt(a.ckpt, dev)
+    print_history(meta)
 
 
 def main():
@@ -635,6 +738,15 @@ def main():
 
     r = sub.add_parser("rollback", parents=[common], help="restore the previous checkpoint")
     r.set_defaults(fn=cmd_rollback)
+
+    ls = sub.add_parser("lessons", parents=[common], help="list or remove saved lesson replay history")
+    lesson_action = ls.add_mutually_exclusive_group()
+    lesson_action.add_argument("--remove", type=int, metavar="N", help="remove one saved lesson")
+    lesson_action.add_argument("--clear", action="store_true", help="remove all saved lessons")
+    ls.set_defaults(fn=cmd_lessons)
+
+    hs = sub.add_parser("history", parents=[common], help="show recent learning runs")
+    hs.set_defaults(fn=cmd_history)
 
     a = p.parse_args()
     torch.manual_seed(a.seed)
