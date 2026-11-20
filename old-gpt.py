@@ -9,7 +9,7 @@ What's new vs v1 (character-level, 3M params, CPU only):
     bf16/fp16 on GPU, best-checkpoint saving, resume, optional torch.compile.
   * Continual learning: `learn` / `/teach` fine-tune on NEW text while replaying your
     old data, measure forgetting, and automatically revert if it forgets too much.
-  * Better sampling: temperature + top-k + top-p, interactive chat REPL.
+  * Better sampling: temperature + top-k + top-p + repetition control, interactive chat REPL.
   * Presets: tiny (CPU) / small / base (GPU). `auto` picks one for your hardware.
 
 Setup:    pip install "torch>=2.3"
@@ -209,12 +209,16 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, n, temp=0.8, top_k=50, top_p=0.95):
+    def generate(self, idx, n, temp=0.8, top_k=50, top_p=0.95,
+                 repetition_penalty=1.15, frequency_penalty=0.0):
         was_training = self.training
         self.eval()
         for _ in range(n):
             logits, _ = self(idx[:, -self.cfg["block"]:])
             l = logits[:, -1].float() / max(temp, 1e-5)
+            if repetition_penalty != 1.0 or frequency_penalty:
+                l = penalize_repetition(
+                    l, idx, repetition_penalty, frequency_penalty)
             if top_k:
                 v, _ = torch.topk(l, min(top_k, l.size(-1)))
                 l = l.masked_fill(l < v[:, [-1]], float("-inf"))
@@ -228,10 +232,34 @@ class GPT(nn.Module):
         return idx
 
 
-def sample(model, prompt, dev, n=600, temp=0.8, top_k=50, top_p=0.95):
+def sample(model, prompt, dev, n=600, temp=0.8, top_k=50, top_p=0.95,
+           repetition_penalty=1.15, frequency_penalty=0.0):
     ids = list(prompt.encode("utf-8")) or [10]
     idx = torch.tensor([ids], device=dev)
-    return decode(model.generate(idx, n, temp, top_k, top_p)[0].tolist())
+    return decode(model.generate(
+        idx, n, temp, top_k, top_p, repetition_penalty, frequency_penalty
+    )[0].tolist())
+
+
+def penalize_repetition(logits, ids, repetition_penalty=1.15,
+                        frequency_penalty=0.0):
+    """Reduce the chance of repeating tokens already present in the context."""
+    if repetition_penalty <= 0:
+        raise ValueError("repetition_penalty must be greater than 0.")
+    if frequency_penalty < 0:
+        raise ValueError("frequency_penalty must not be negative.")
+    if repetition_penalty != 1.0:
+        seen = torch.zeros_like(logits, dtype=torch.bool)
+        seen.scatter_(1, ids, True)
+        positive = logits >= 0
+        logits = torch.where(
+            seen & positive, logits / repetition_penalty,
+            torch.where(seen, logits * repetition_penalty, logits))
+    if frequency_penalty:
+        counts = torch.zeros_like(logits)
+        counts.scatter_add_(1, ids, torch.ones_like(ids, dtype=logits.dtype))
+        logits = logits - counts * frequency_penalty
+    return logits
 
 
 # ----------------------------------------------------------------------------- training
@@ -641,7 +669,8 @@ def cmd_train(a):
 def cmd_gen(a):
     dev = pick_device(a.device)
     model, _, _ = load_ckpt(a.ckpt, dev)
-    print(sample(model, a.prompt, dev, a.n, a.temp, a.top_k, a.top_p))
+    print(sample(model, a.prompt, dev, a.n, a.temp, a.top_k, a.top_p,
+                 a.repetition_penalty, a.frequency_penalty))
 
 
 def cmd_learn(a):
@@ -743,7 +772,8 @@ def cmd_chat(a):
                 print("commands: /teach <text|@file>, /temp N, /lessons, /forget N, "
                       "/history, /status, /save, /quit")
         else:
-            print(sample(model, line, dev, a.n, temp, a.top_k, a.top_p))
+            print(sample(model, line, dev, a.n, temp, a.top_k, a.top_p,
+                         a.repetition_penalty, a.frequency_penalty))
     if dirty and input("Save what I learned this session? [y/N] ").strip().lower() == "y":
         save_ckpt(a.ckpt, model, cfg, meta)
         print("saved.")
@@ -804,6 +834,10 @@ def main():
     gen_args.add_argument("--temp", type=float, default=0.8)
     gen_args.add_argument("--top-k", type=int, default=50)
     gen_args.add_argument("--top-p", type=float, default=0.95)
+    gen_args.add_argument("--repetition-penalty", type=float, default=1.15,
+                          help="penalise tokens already in context (1 disables)")
+    gen_args.add_argument("--frequency-penalty", type=float, default=0.0,
+                          help="subtract this per occurrence from token logits")
 
     learn_args = argparse.ArgumentParser(add_help=False)
     learn_args.add_argument("--lr", type=float, default=2e-4)

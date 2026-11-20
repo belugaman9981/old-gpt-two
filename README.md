@@ -31,6 +31,11 @@ metadata; they include settings and before/after loss values.
 Use `python old-gpt.py status` for checkpoint size, model shape, training steps,
 saved lesson count, and learning-run totals. Chat also supports `/status`.
 
+Generation uses repetition control by default, which helps prevent the small
+byte-level model from getting stuck repeating words or punctuation. Adjust it
+with `--repetition-penalty` (default `1.15`) and `--frequency-penalty` (default
+`0`) on `gen` or `chat`; use `--repetition-penalty 1` to disable it.
+
 On CPU, `train --preset auto` chooses `base` for systems with at least 24 GB RAM
 and 12 logical CPUs, `small` for at least 8 GB and 8 CPUs, otherwise `tiny`.
 CPU training uses up to eight threads by default while leaving four cores free.

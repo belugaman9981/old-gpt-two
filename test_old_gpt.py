@@ -35,6 +35,22 @@ class LossModel(nn.Module):
 
 
 class LearningTests(unittest.TestCase):
+    def test_repetition_penalty_changes_seen_logits(self):
+        logits = torch.tensor([[2.0, -2.0, 1.0]])
+        ids = torch.tensor([[0, 1, 1]])
+        adjusted = gpt.penalize_repetition(logits, ids, 2.0, 0.5)
+        self.assertAlmostEqual(adjusted[0, 0].item(), 0.5)
+        self.assertAlmostEqual(adjusted[0, 1].item(), -5.0)
+        self.assertAlmostEqual(adjusted[0, 2].item(), 1.0)
+
+    def test_repetition_penalty_rejects_invalid_values(self):
+        logits = torch.zeros(1, 2)
+        ids = torch.zeros(1, 1, dtype=torch.long)
+        with self.assertRaises(ValueError):
+            gpt.penalize_repetition(logits, ids, 0)
+        with self.assertRaises(ValueError):
+            gpt.penalize_repetition(logits, ids, 1, -0.1)
+
     def test_replay_is_mixed_in_each_batch(self):
         sources = [ConstantCorpus(1), ConstantCorpus(2)]
         x, y = gpt.training_batch(sources, [0.5, 0.5], 8, "cpu")
