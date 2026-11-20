@@ -1,5 +1,9 @@
 import importlib.util
+import contextlib
+import io
 from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -76,6 +80,79 @@ class LearningTests(unittest.TestCase):
         before = model.tok.weight.detach().clone()
         gpt.learn(model, gpt.encode("simple training text"), None, cfg, "cpu", iters=2, bs=2)
         self.assertFalse(torch.equal(before, model.tok.weight))
+
+    def test_replay_balances_original_data_and_lessons(self):
+        replay = gpt.ReplayCorpus(ConstantCorpus(90), ["aaaa", "bbbb"], 1)
+        with patch.object(gpt.random, "choices", return_value=[0, 1, 0, 1]):
+            x, _ = replay.batch("train", 8, "cpu")
+        self.assertEqual((x == 90).sum().item(), 4)
+        self.assertEqual((x == ord("a")).sum().item(), 2)
+        self.assertEqual((x == ord("b")).sum().item(), 2)
+
+    def test_learn_saves_lessons_and_rollback_restores_history(self):
+        cfg = dict(block=4, n_embd=8, n_head=2, n_layer=1, dropout=0.0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "model.pt")
+            args = SimpleNamespace(device="cpu", ckpt=path, data=directory, files=[],
+                                   text="aaaa", iters=1, lr=0.001, batch=2,
+                                   new_frac=0.5, max_forget=0.25, force=False)
+            gpt.save_ckpt(path, gpt.GPT(cfg), cfg, {"steps": 0, "learned": []})
+            observed = []
+
+            def accept(model, ids, old, *args):
+                observed.append(None if old is None else old.batch("train", 2, "cpu")[0])
+                return dict(b_new=1.0, a_new=0.5, b_old=None, a_old=None, reverted=False)
+
+            with patch.object(gpt, "learn", side_effect=accept), contextlib.redirect_stdout(io.StringIO()):
+                gpt.cmd_learn(args)
+                args.text = "bbbb"
+                gpt.cmd_learn(args)
+            self.assertIsNone(observed[0])
+            self.assertTrue(torch.all(observed[1] == ord("a")))
+            self.assertEqual(gpt.load_ckpt(path, "cpu")[2]["lesson_texts"], ["aaaa", "bbbb"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                gpt.cmd_rollback(args)
+            self.assertEqual(gpt.load_ckpt(path, "cpu")[2]["lesson_texts"], ["aaaa"])
+
+    def test_chat_replays_accepted_lessons_and_only_saves_on_request(self):
+        cfg = dict(block=4, n_embd=8, n_head=2, n_layer=1, dropout=0.0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "model.pt")
+            gpt.save_ckpt(path, gpt.GPT(cfg), cfg, {"steps": 0, "learned": []})
+            args = SimpleNamespace(device="cpu", ckpt=path, data=directory, temp=0.8,
+                                   teach_iters=1, lr=0.001, new_frac=0.5,
+                                   max_forget=0.25, n=1, top_k=1, top_p=1.0)
+            observed = []
+
+            def teach(model, ids, old, *args, **kwargs):
+                observed.append(None if old is None else old.batch("train", 2, "cpu")[0])
+                return dict(b_new=1.0, a_new=0.5, b_old=None, a_old=None,
+                            reverted=len(observed) == 2)
+
+            inputs = ["/teach aaaa", "/teach bbbb", "/save", "/teach cccc", "/quit", "n"]
+            with patch.object(gpt, "learn", side_effect=teach), \
+                    patch("builtins.input", side_effect=inputs), contextlib.redirect_stdout(io.StringIO()):
+                gpt.cmd_chat(args)
+            self.assertIsNone(observed[0])
+            self.assertTrue(torch.all(observed[1] == ord("a")))
+            self.assertTrue(torch.all(observed[2] == ord("a")))
+            self.assertEqual(gpt.load_ckpt(path, "cpu")[2]["lesson_texts"], ["aaaa"])
+
+    def test_two_real_learning_runs_replay_saved_lesson(self):
+        torch.manual_seed(1)
+        cfg = dict(block=4, n_embd=8, n_head=2, n_layer=1, dropout=0.0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "model.pt")
+            gpt.save_ckpt(path, gpt.GPT(cfg), cfg, {"steps": 0, "learned": []})
+            args = SimpleNamespace(device="cpu", ckpt=path, data=directory, files=[],
+                                   text="first lesson", iters=2, lr=0.001, batch=2,
+                                   new_frac=0.5, max_forget=0.25, force=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                gpt.cmd_learn(args)
+                args.text = "second lesson"
+                gpt.cmd_learn(args)
+            self.assertEqual(gpt.load_ckpt(path, "cpu")[2]["lesson_texts"],
+                             ["first lesson", "second lesson"])
 
 
 if __name__ == "__main__":

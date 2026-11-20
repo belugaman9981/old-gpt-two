@@ -11,3 +11,13 @@ Forgetting is checked using the same sampled validation batches before and
 after learning; the model is reverted if old-data loss rises above
 `--max-forget` unless `learn --force` is used. Small texts may be repeated to
 make batches, so their validation loss is not necessarily a held-out measure.
+
+Accepted `learn` and `/teach` text is stored in full in the checkpoint and
+replayed during later `learn` or `/teach` sessions. If both original data and
+lessons are available, each receives half of the replay examples; lessons are
+sampled equally. A lesson rejected by the forgetting check is not saved.
+Chat lessons are available immediately during the session, but only persist
+if you save. Checkpoint backups and rollback include the lesson history.
+Older checkpoints do not contain lesson text, so past lessons cannot be
+replayed unless taught again. Treat checkpoints and their backups as containing
+your lesson text. `train --resume` still trains on the data directory only.

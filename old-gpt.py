@@ -30,6 +30,7 @@ Note: v1 checkpoints (old_gpt.pt, char-level) are not compatible - retrain with 
 """
 import argparse, contextlib, glob, math, os, random, shutil, sys, time
 import re
+from collections import Counter
 import torch, torch.nn as nn, torch.nn.functional as F
 
 CKPT = "old_gpt_v2.pt"
@@ -285,16 +286,47 @@ def lr_at(it, iters, lr, warmup):
     return lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * p)))  # cosine down to 10%
 
 
-def training_batch(sources, probs, bs, dev):
+def training_batch(sources, probs, bs, dev, split="train"):
     if len(sources) == 1:
-        return sources[0].batch("train", bs, dev)
+        return sources[0].batch(split, bs, dev)
     expected = bs * probs[0]
     new_count = int(expected)
     if random.random() < expected - new_count:
         new_count += 1
-    batches = [source.batch("train", count, dev)
+    batches = [source.batch(split, count, dev)
                for source, count in zip(sources, (new_count, bs - new_count)) if count]
     return tuple(torch.cat(parts, dim=0) for parts in zip(*batches))
+
+
+class LessonCorpus:
+    """Sample lessons equally, rather than letting long lessons dominate replay."""
+
+    def __init__(self, texts, block):
+        self.block = block
+        self.lessons = [Corpus(encode(text), block) for text in texts]
+
+    def add(self, text):
+        self.lessons.append(Corpus(encode(text), self.block))
+
+    def batch(self, split, bs, dev):
+        counts = Counter(random.choices(range(len(self.lessons)), k=bs))
+        batches = [self.lessons[i].batch(split, count, dev) for i, count in counts.items()]
+        return tuple(torch.cat(parts, dim=0) for parts in zip(*batches))
+
+
+class ReplayCorpus:
+    def __init__(self, data, texts, block):
+        self.data = data
+        self.lessons = LessonCorpus(texts, block)
+
+    def add(self, text):
+        self.lessons.add(text)
+
+    def batch(self, split, bs, dev):
+        sources = ([self.data] if self.data is not None else [])
+        if self.lessons.lessons:
+            sources.append(self.lessons)
+        return training_batch(sources, [0.5, 0.5], bs, dev, split)
 
 
 def fit(model, sources, probs, iters, lr, bs, dev, warmup=100, wd=0.1,
@@ -375,7 +407,7 @@ def report(r, max_forget):
     if r["b_old"] is not None:
         s += f" | old data loss {r['b_old']:.3f} -> {r['a_old']:.3f}"
     else:
-        s += " | (no ./data found, so forgetting can't be measured)"
+        s += " | (no replay data available, so forgetting can't be measured)"
     if r["reverted"]:
         s += (f"\n  !! old-data loss rose by more than {max_forget} - it was forgetting too much, so I REVERTED. "
               f"Try a lower --lr, fewer --iters, or a smaller --new-frac (or --force to keep it).")
@@ -405,6 +437,11 @@ def load_ckpt(path, dev):
 def try_old_corpus(a, block):
     ids = encode(load_text(a.data)) if os.path.isdir(a.data) else None
     return Corpus(ids, block) if ids is not None and len(ids) > block * 8 else None
+
+
+def replay_corpus(data, meta, block):
+    texts = meta.get("lesson_texts", [])
+    return ReplayCorpus(data, texts, block) if data is not None or texts else None
 
 
 # ----------------------------------------------------------------------------- commands
@@ -470,14 +507,15 @@ def cmd_learn(a):
         text += ("\n\n" if text else "") + a.text
     if not text.strip():
         sys.exit("Give me something to learn: files and/or --text \"...\"")
-    old = try_old_corpus(a, cfg["block"])
+    old = replay_corpus(try_old_corpus(a, cfg["block"]), meta, cfg["block"])
     if not old:
-        print("warning: no replay data in ./data - the model may forget what it knew.")
+        print("warning: no replay data or saved lessons - the model may forget what it knew.")
     r = learn(model, encode(text), old, cfg, dev, a.iters, a.lr, a.batch, a.new_frac, a.max_forget, a.force)
     print(report(r, a.max_forget))
     if r["reverted"]:
         return
     meta["learned"] = meta.get("learned", []) + [(a.files or ["--text"])[0]]
+    meta.setdefault("lesson_texts", []).append(text)
     meta["steps"] = meta.get("steps", 0) + a.iters
     save_ckpt(a.ckpt, model, cfg, meta)
     print(f"saved to {a.ckpt} (previous version kept as {a.ckpt}.prev)")
@@ -486,7 +524,7 @@ def cmd_learn(a):
 def cmd_chat(a):
     dev = pick_device(a.device)
     model, cfg, meta = load_ckpt(a.ckpt, dev)
-    old = try_old_corpus(a, cfg["block"])
+    old = replay_corpus(try_old_corpus(a, cfg["block"]), meta, cfg["block"])
     temp, dirty = a.temp, False
     print("Type a prompt and I'll continue it.\n"
           "  /teach <text or @file>   learn something new right now (replays old data to avoid forgetting)\n"
@@ -521,7 +559,12 @@ def cmd_chat(a):
                 r = learn(model, encode(text), old, cfg, dev, iters=a.teach_iters, lr=a.lr,
                           bs=16, new_frac=a.new_frac, max_forget=a.max_forget)
                 print(report(r, a.max_forget))
-                dirty = dirty or not r["reverted"]
+                if not r["reverted"]:
+                    meta.setdefault("lesson_texts", []).append(text)
+                    if old is None:
+                        old = ReplayCorpus(None, [], cfg["block"])
+                    old.add(text)
+                    dirty = True
             else:
                 print("commands: /teach <text|@file>, /temp N, /save, /quit")
         else:
