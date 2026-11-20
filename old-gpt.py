@@ -44,7 +44,7 @@ PRESETS = {  # model shape            (params: ~2.7M / ~14M / ~38M)
 TRAIN_DEFAULTS = {
     "tiny":  dict(batch=32, lr=1e-3, iters=5000),
     "small": dict(batch=32, lr=6e-4, iters=8000),
-    "base":  dict(batch=16, lr=3e-4, iters=15000),
+    "base":  dict(batch=24, lr=3e-4, iters=15000),
 }
 
 # ----------------------------------------------------------------------------- data
@@ -254,6 +254,54 @@ def pick_device(name):
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def available_ram_gb():
+    if os.name == "nt":
+        try:
+            import ctypes
+            kb = ctypes.c_ulonglong()
+            if ctypes.windll.kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(kb)):
+                return kb.value / (1024 * 1024)
+        except Exception:
+            pass
+    try:
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
+def pick_auto_preset(dev, preset):
+    if preset != "auto":
+        return preset
+    if dev == "cuda":
+        try:
+            vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            if vram >= 24:
+                return "base"
+        except Exception:
+            pass
+        return "small"
+    if dev == "mps":
+        return "small"
+    cores = os.cpu_count() or 1
+    ram = available_ram_gb()
+    if ram >= 24 and cores >= 12:
+        return "base"
+    if ram >= 8 and cores >= 8:
+        return "small"
+    return "tiny"
+
+
+def safe_cpu_threads():
+    cores = os.cpu_count() or 1
+    if cores <= 4:
+        return cores
+    return min(8, max(1, cores - 4))
 
 
 def amp_setup(dev):
@@ -486,6 +534,9 @@ def checkpoint_status(path, model, cfg, meta):
     size = os.path.getsize(path) if os.path.exists(path) else 0
     print(f"checkpoint: {path}")
     print(f"size: {size / (1024 * 1024):.2f} MB")
+    ram = available_ram_gb()
+    print(f"hardware: {(ram / 1.0):.1f} GB RAM" if ram else "hardware: RAM unknown",
+          f"| {os.cpu_count() or 1} logical CPUs")
     print(f"model: {n_params:.1f}M parameters | {cfg['n_layer']} layers "
           f"| {cfg['n_embd']} embedding width | context {cfg['block']} bytes")
     print(f"training steps: {meta.get('steps', 0):,}")
@@ -524,7 +575,7 @@ def record_experiment(meta, r, iters, lr, bs, new_frac, max_forget, source):
 
 def cmd_train(a):
     dev = pick_device(a.device)
-    preset = a.preset if a.preset != "auto" else ("small" if dev == "cuda" else "tiny")
+    preset = pick_auto_preset(dev, a.preset)
     td = TRAIN_DEFAULTS[preset]
     iters, bs, lr = a.iters or td["iters"], a.batch or td["batch"], a.lr or td["lr"]
 
@@ -541,7 +592,10 @@ def cmd_train(a):
             cfg["dropout"] = a.dropout
         model, meta = GPT(cfg).to(dev), {"steps": 0, "learned": []}
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"device {dev} | preset {preset} | {len(ids):,} bytes | {n_params:.1f}M parameters | {iters} iters")
+    ram = available_ram_gb()
+    hardware = f"{ram:.1f} GB RAM" if ram else "RAM unknown"
+    print(f"device {dev} | preset {preset} | {hardware} | {len(ids):,} bytes "
+          f"| {n_params:.1f}M parameters | {iters} iters")
 
     if os.path.exists(a.ckpt):
         shutil.copyfile(a.ckpt, a.ckpt + ".prev")  # back up once, before this run
@@ -723,7 +777,8 @@ def main():
     common.add_argument("--data", default="data")
     common.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     common.add_argument("--seed", type=int, default=1)
-    common.add_argument("--threads", type=int, default=0, help="CPU threads to use (default: half your cores, up to 4)")
+    common.add_argument("--threads", type=int, default=0,
+                        help="CPU threads (default: leave 4 cores free, up to 8)")
     common.add_argument("--low-priority", action="store_true", help="run at low priority so the PC stays usable")
 
     gen_args = argparse.ArgumentParser(add_help=False)
@@ -785,7 +840,7 @@ def main():
     a = p.parse_args()
     torch.manual_seed(a.seed)
     random.seed(a.seed)
-    torch.set_num_threads(a.threads or min(4, max(1, (os.cpu_count() or 2) // 2)))
+    torch.set_num_threads(a.threads or safe_cpu_threads())
     if a.low_priority:
         lower_priority()
     a.fn(a)

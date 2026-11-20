@@ -213,6 +213,20 @@ class LearningTests(unittest.TestCase):
             self.assertIn("1 accepted", text)
             self.assertIn("1 reverted", text)
 
+    def test_cpu_auto_preset_uses_available_hardware(self):
+        with patch.object(gpt, "available_ram_gb", return_value=32.0), \
+                patch.object(gpt.os, "cpu_count", return_value=16):
+            self.assertEqual(gpt.pick_auto_preset("cpu", "auto"), "base")
+            self.assertEqual(gpt.pick_auto_preset("cpu", "tiny"), "tiny")
+            self.assertEqual(gpt.safe_cpu_threads(), 8)
+        with patch.object(gpt, "available_ram_gb", return_value=8.0), \
+                patch.object(gpt.os, "cpu_count", return_value=8):
+            self.assertEqual(gpt.pick_auto_preset("cpu", "auto"), "small")
+        with patch.object(gpt, "available_ram_gb", return_value=4.0), \
+                patch.object(gpt.os, "cpu_count", return_value=4):
+            self.assertEqual(gpt.pick_auto_preset("cpu", "auto"), "tiny")
+            self.assertEqual(gpt.safe_cpu_threads(), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
