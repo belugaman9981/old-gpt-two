@@ -1,4 +1,3 @@
-
 """old_gpt v2.0 - a tiny GPT that trains on your own text AND keeps learning.
 
 What's new vs v1 (character-level, 3M params, CPU only):
@@ -71,9 +70,14 @@ def read_files(paths):
     return "\n\n".join(parts)
 
 
+DATA_EXTS = (".txt", ".md", ".py", ".js", ".ts", ".html", ".css", ".java", ".c", ".cpp", ".h")
+
+
 def load_text(data_dir):
-    files = sorted(glob.glob(os.path.join(data_dir, "*.txt")) + glob.glob(os.path.join(data_dir, "*.md")))
-    return read_files(files)
+    files = set()
+    for ext in DATA_EXTS:
+        files.update(glob.glob(os.path.join(data_dir, "**", "*" + ext), recursive=True))
+    return read_files(sorted(files))
 
 
 def encode(text):
@@ -379,7 +383,7 @@ class ReplayCorpus:
 
 
 def fit(model, sources, probs, iters, lr, bs, dev, warmup=100, wd=0.1,
-        eval_every=0, eval_corpus=None, on_best=None, log_every=0):
+        eval_every=0, eval_corpus=None, on_best=None, log_every=0, patience=0, state=None):
     ctx, dt = amp_setup(dev)
     scaler = torch.amp.GradScaler("cuda") if dt == torch.float16 else None
     params = [p for p in model.parameters() if p.requires_grad]
@@ -388,16 +392,24 @@ def fit(model, sources, probs, iters, lr, bs, dev, warmup=100, wd=0.1,
          {"params": [p for p in params if p.dim() < 2], "weight_decay": 0.0}],
         lr=lr, betas=(0.9, 0.95), fused=(dev == "cuda"))
     model.train()
-    t0, run, best = time.time(), None, float("inf")
+    t0, run, best, bad = time.time(), None, float("inf"), 0
     for it in range(iters + 1):
+        if state is not None:
+            state["it"] = it
         if eval_every and (it % eval_every == 0 or it == iters):
             v = evaluate(model, eval_corpus, bs, dev)
             tr = f"{run:.3f}" if run is not None else "-"
             print(f"iter {it:5d} | train {tr} | val {v:.3f} ({v / math.log(2):.3f} bits/byte) | {time.time() - t0:.0f}s")
             if v < best:
-                best = v
+                best, bad = v, 0
                 if on_best:
                     on_best(v)
+            else:
+                bad += 1
+                if patience and bad >= patience:
+                    print(f"validation loss hasn't improved for {bad} checks - stopping early "
+                          f"(more training would just memorise the data; add more text instead).")
+                    break
         elif log_every and it % log_every == 0 and run is not None:
             elapsed = time.time() - t0
             remaining = elapsed * (iters - it) / it
@@ -607,13 +619,19 @@ def cmd_train(a):
         except Exception as e:
             print("torch.compile unavailable, continuing without:", e)
 
+    epochs = iters * bs * cfg["block"] / len(ids)
+    print(f"this run shows the model your data ~{epochs:.0f} times"
+          + (" - that is a lot, expect memorising; more text would make it smarter." if epochs > 30 else "."))
+    base_steps, state = meta.get("steps", 0), {"it": 0}
+
     def on_best(v):
+        meta["steps"] = base_steps + state["it"]  # so interrupted runs still count their progress
         save_ckpt(a.ckpt, model, cfg, meta, backup=False)
 
     fit(fwd, [corpus], [1.0], iters, lr, bs, dev, warmup=min(100, iters // 10),
         eval_every=a.eval_every, eval_corpus=corpus, on_best=on_best,
-        log_every=max(1, min(100, iters // 10)))
-    meta["steps"] = meta.get("steps", 0) + iters
+        log_every=max(1, min(100, iters // 10)), patience=a.patience, state=state)
+    meta["steps"] = base_steps + state["it"]
     ck = torch.load(a.ckpt, map_location=dev, weights_only=True)  # re-save best weights with updated meta
     model.load_state_dict(ck["model"])
     save_ckpt(a.ckpt, model, cfg, meta, backup=False)
@@ -802,6 +820,7 @@ def main():
     t.add_argument("--lr", type=float)
     t.add_argument("--dropout", type=float)
     t.add_argument("--eval-every", type=int, default=250)
+    t.add_argument("--patience", type=int, default=8, help="stop after this many validation checks without improvement (0 = never)")
     t.add_argument("--resume", action="store_true")
     t.add_argument("--compile", action="store_true", help="torch.compile (Linux/CUDA; skip on Windows)")
     t.set_defaults(fn=cmd_train)
