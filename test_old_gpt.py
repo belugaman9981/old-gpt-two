@@ -190,6 +190,29 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(len(meta["experiments"]), 100)
         self.assertEqual(meta["experiments"][0]["iters"], 5)
 
+    def test_status_reports_checkpoint_and_learning_totals(self):
+        cfg = dict(block=4, n_embd=8, n_head=2, n_layer=1, dropout=0.0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "model.pt")
+            meta = {
+                "steps": 42,
+                "lesson_texts": ["one", "two"],
+                "experiments": [
+                    {"timestamp": "2026-01-01 00:00:00", "reverted": False, "iters": 10},
+                    {"timestamp": "2026-01-02 00:00:00", "reverted": True, "iters": 20},
+                ],
+            }
+            gpt.save_ckpt(path, gpt.GPT(cfg), cfg, meta)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                gpt.checkpoint_status(path, gpt.GPT(cfg), cfg, meta)
+            text = output.getvalue()
+            self.assertIn("42", text)
+            self.assertIn("saved lessons: 2", text)
+            self.assertIn("2 runs", text)
+            self.assertIn("1 accepted", text)
+            self.assertIn("1 reverted", text)
+
 
 if __name__ == "__main__":
     unittest.main()

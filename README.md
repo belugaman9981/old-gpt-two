@@ -27,3 +27,6 @@ Use `python old-gpt.py lessons` to list saved lessons. Remove one with
 `python old-gpt.py lessons --clear`. In chat, use `/lessons`, `/forget N`, and
 `/history`. The most recent 100 learning runs are retained in checkpoint
 metadata; they include settings and before/after loss values.
+
+Use `python old-gpt.py status` for checkpoint size, model shape, training steps,
+saved lesson count, and learning-run totals. Chat also supports `/status`.

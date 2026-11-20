@@ -477,6 +477,28 @@ def print_history(meta):
         )
 
 
+def checkpoint_status(path, model, cfg, meta):
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    lessons = meta.get("lesson_texts", [])
+    experiments = meta.get("experiments", [])
+    accepted = sum(not entry.get("reverted", False) for entry in experiments)
+    reverted = sum(entry.get("reverted", False) for entry in experiments)
+    size = os.path.getsize(path) if os.path.exists(path) else 0
+    print(f"checkpoint: {path}")
+    print(f"size: {size / (1024 * 1024):.2f} MB")
+    print(f"model: {n_params:.1f}M parameters | {cfg['n_layer']} layers "
+          f"| {cfg['n_embd']} embedding width | context {cfg['block']} bytes")
+    print(f"training steps: {meta.get('steps', 0):,}")
+    print(f"saved lessons: {len(lessons)}")
+    print(f"learning history: {len(experiments)} runs "
+          f"| {accepted} accepted | {reverted} reverted")
+    if experiments:
+        last = experiments[-1]
+        print(f"last run: {last['timestamp']} | "
+              f"{'reverted' if last['reverted'] else 'accepted'} "
+              f"| {last['iters']} iters")
+
+
 def record_experiment(meta, r, iters, lr, bs, new_frac, max_forget, source):
     entry = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -586,6 +608,7 @@ def cmd_chat(a):
           "  /lessons                 list saved lessons\n"
           "  /forget N                remove lesson N and replay history\n"
           "  /history                 show learning runs\n"
+          "  /status                  show checkpoint statistics\n"
           "  /save                    keep what I learned    /quit  exit")
     while True:
         try:
@@ -612,6 +635,8 @@ def cmd_chat(a):
                 print_lessons(meta)
             elif cmd == "history":
                 print_history(meta)
+            elif cmd == "status":
+                checkpoint_status(a.ckpt, model, cfg, meta)
             elif cmd == "forget":
                 try:
                     index = int(rest)
@@ -644,7 +669,7 @@ def cmd_chat(a):
                     dirty = True
             else:
                 print("commands: /teach <text|@file>, /temp N, /lessons, /forget N, "
-                      "/history, /save, /quit")
+                      "/history, /status, /save, /quit")
         else:
             print(sample(model, line, dev, a.n, temp, a.top_k, a.top_p))
     if dirty and input("Save what I learned this session? [y/N] ").strip().lower() == "y":
@@ -684,6 +709,12 @@ def cmd_history(a):
     dev = pick_device(a.device)
     _, _, meta = load_ckpt(a.ckpt, dev)
     print_history(meta)
+
+
+def cmd_status(a):
+    dev = pick_device(a.device)
+    model, cfg, meta = load_ckpt(a.ckpt, dev)
+    checkpoint_status(a.ckpt, model, cfg, meta)
 
 
 def main():
@@ -747,6 +778,9 @@ def main():
 
     hs = sub.add_parser("history", parents=[common], help="show recent learning runs")
     hs.set_defaults(fn=cmd_history)
+
+    ss = sub.add_parser("status", parents=[common], help="show checkpoint and learning statistics")
+    ss.set_defaults(fn=cmd_status)
 
     a = p.parse_args()
     torch.manual_seed(a.seed)
