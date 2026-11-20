@@ -19,6 +19,7 @@ Usage:
   python old_gpt_v2.py train                         # train from scratch (auto preset)
   python old_gpt_v2.py train --preset small --iters 8000
   python old_gpt_v2.py train --resume --iters 3000   # keep training the saved model
+  python old_gpt_v2.py train --threads 4 --batch 128 --iters 2500 --low-priority   # gentle on CPU, bigger batches in RAM
   python old_gpt_v2.py gen "Whan that Aprille"       # sample
   python old_gpt_v2.py learn notes.txt more.md       # learn new files without forgetting
   python old_gpt_v2.py learn --text "Matt's dog is named Max."
@@ -96,9 +97,8 @@ class Corpus:
     def batch(self, split, bs, dev):
         d = self.tr if split == "train" else self.va
         ix = torch.randint(len(d) - self.block - 1, (bs,))
-        x = torch.stack([d[i:i + self.block] for i in ix])
-        y = torch.stack([d[i + 1:i + self.block + 1] for i in ix])
-        return x.to(dev), y.to(dev)
+        pos = ix[:, None] + torch.arange(self.block)  # one gather instead of a Python loop
+        return d[pos].to(dev), d[pos + 1].to(dev)
 
 
 # ----------------------------------------------------------------------------- model
@@ -229,6 +229,19 @@ def sample(model, prompt, dev, n=600, temp=0.8, top_k=50, top_p=0.95):
 
 
 # ----------------------------------------------------------------------------- training
+
+
+def lower_priority():
+    """Run politely in the background so the PC stays responsive."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            k = ctypes.windll.kernel32
+            k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)  # BELOW_NORMAL
+        else:
+            os.nice(10)
+    except Exception:
+        pass
 
 
 def pick_device(name):
@@ -505,6 +518,8 @@ def main():
     common.add_argument("--data", default="data")
     common.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     common.add_argument("--seed", type=int, default=1)
+    common.add_argument("--threads", type=int, default=0, help="CPU threads to use (default: half your cores)")
+    common.add_argument("--low-priority", action="store_true", help="run at low priority so the PC stays usable")
 
     gen_args = argparse.ArgumentParser(add_help=False)
     gen_args.add_argument("-n", type=int, default=600, help="bytes to generate")
@@ -553,9 +568,11 @@ def main():
     a = p.parse_args()
     torch.manual_seed(a.seed)
     random.seed(a.seed)
-    torch.set_num_threads(os.cpu_count() or 4)
+    torch.set_num_threads(a.threads or max(1, (os.cpu_count() or 2) // 2))
+    if a.low_priority:
+        lower_priority()
     a.fn(a)
 
 
 if __name__ == "__main__":
-    main() 
+    main()
