@@ -263,17 +263,19 @@ def amp_setup(dev):
 
 
 @torch.no_grad()
-def evaluate(model, corpus, bs, dev, n=20):
+def evaluate(model, corpus, bs, dev, n=20, batches=None):
     ctx, _ = amp_setup(dev)
     was_training = model.training
     model.eval()
     tot = 0.0
-    for _ in range(n):
-        x, y = corpus.batch("val", bs, dev)
+    if batches is None:
+        batches = [corpus.batch("val", bs, "cpu") for _ in range(n)]
+    for x, y in batches:
+        x, y = x.to(dev), y.to(dev)
         with ctx():
             tot += model(x, y)[1].item()
     model.train(was_training)
-    return tot / n
+    return tot / len(batches)
 
 
 def lr_at(it, iters, lr, warmup):
@@ -281,6 +283,18 @@ def lr_at(it, iters, lr, warmup):
         return lr * (it + 1) / warmup
     p = (it - warmup) / max(1, iters - warmup)
     return lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * p)))  # cosine down to 10%
+
+
+def training_batch(sources, probs, bs, dev):
+    if len(sources) == 1:
+        return sources[0].batch("train", bs, dev)
+    expected = bs * probs[0]
+    new_count = int(expected)
+    if random.random() < expected - new_count:
+        new_count += 1
+    batches = [source.batch("train", count, dev)
+               for source, count in zip(sources, (new_count, bs - new_count)) if count]
+    return tuple(torch.cat(parts, dim=0) for parts in zip(*batches))
 
 
 def fit(model, sources, probs, iters, lr, bs, dev, warmup=100, wd=0.1,
@@ -304,12 +318,14 @@ def fit(model, sources, probs, iters, lr, bs, dev, warmup=100, wd=0.1,
                 if on_best:
                     on_best(v)
         elif log_every and it % log_every == 0 and run is not None:
-            print(f"  step {it}/{iters} | loss {run:.3f}")
+            elapsed = time.time() - t0
+            remaining = elapsed * (iters - it) / it
+            print(f"  step {it}/{iters} | smoothed loss {run:.3f} | {elapsed:.0f}s elapsed | ~{remaining:.0f}s remaining", flush=True)
         if it == iters:
             break
         for g in opt.param_groups:
             g["lr"] = lr_at(it, iters, lr, warmup)
-        x, y = random.choices(sources, probs)[0].batch("train", bs, dev)
+        x, y = training_batch(sources, probs, bs, dev)
         with ctx():
             loss = model(x, y)[1]
         if scaler:
@@ -333,14 +349,21 @@ def fit(model, sources, probs, iters, lr, bs, dev, warmup=100, wd=0.1,
 def learn(model, new_ids, old, cfg, dev, iters=300, lr=2e-4, bs=16, new_frac=0.5,
           max_forget=0.25, force=False):
     """Fine-tune on new text while replaying old data. Reverts if old-data loss rises too much."""
+    if not len(new_ids):
+        raise ValueError("Cannot learn from empty text.")
+    if not 0 <= new_frac <= 1:
+        raise ValueError("new_frac must be between 0 and 1.")
     new = Corpus(new_ids, cfg["block"])
     snap = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    b_new = evaluate(model, new, bs, dev, n=10)
-    b_old = evaluate(model, old, bs, dev, n=10) if old else None
+    new_batches = [new.batch("val", bs, "cpu") for _ in range(10)]
+    old_batches = [old.batch("val", bs, "cpu") for _ in range(10)] if old else None
+    b_new = evaluate(model, new, bs, dev, batches=new_batches)
+    b_old = evaluate(model, old, bs, dev, batches=old_batches) if old else None
     sources, probs = ([new, old], [new_frac, 1 - new_frac]) if old else ([new], [1.0])
-    fit(model, sources, probs, iters, lr, bs, dev, warmup=max(1, min(20, iters // 5)), log_every=100)
-    a_new = evaluate(model, new, bs, dev, n=10)
-    a_old = evaluate(model, old, bs, dev, n=10) if old else None
+    fit(model, sources, probs, iters, lr, bs, dev, warmup=max(1, min(20, iters // 5)),
+        log_every=max(1, min(100, iters // 10)))
+    a_new = evaluate(model, new, bs, dev, batches=new_batches)
+    a_old = evaluate(model, old, bs, dev, batches=old_batches) if old else None
     reverted = bool(old) and (a_old - b_old) > max_forget and not force
     if reverted:
         model.load_state_dict(snap)
@@ -422,7 +445,8 @@ def cmd_train(a):
         save_ckpt(a.ckpt, model, cfg, meta, backup=False)
 
     fit(fwd, [corpus], [1.0], iters, lr, bs, dev, warmup=min(100, iters // 10),
-        eval_every=a.eval_every, eval_corpus=corpus, on_best=on_best)
+        eval_every=a.eval_every, eval_corpus=corpus, on_best=on_best,
+        log_every=max(1, min(100, iters // 10)))
     meta["steps"] = meta.get("steps", 0) + iters
     ck = torch.load(a.ckpt, map_location=dev, weights_only=True)  # re-save best weights with updated meta
     model.load_state_dict(ck["model"])
@@ -491,6 +515,9 @@ def cmd_chat(a):
                 print("saved.")
             elif cmd == "teach" and rest:
                 text = clean(open(rest[1:], encoding="utf-8", errors="ignore").read()) if rest.startswith("@") else rest
+                if not text.strip():
+                    print("Give me some non-empty text to learn.")
+                    continue
                 r = learn(model, encode(text), old, cfg, dev, iters=a.teach_iters, lr=a.lr,
                           bs=16, new_frac=a.new_frac, max_forget=a.max_forget)
                 print(report(r, a.max_forget))
@@ -518,7 +545,7 @@ def main():
     common.add_argument("--data", default="data")
     common.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     common.add_argument("--seed", type=int, default=1)
-    common.add_argument("--threads", type=int, default=0, help="CPU threads to use (default: half your cores)")
+    common.add_argument("--threads", type=int, default=0, help="CPU threads to use (default: half your cores, up to 4)")
     common.add_argument("--low-priority", action="store_true", help="run at low priority so the PC stays usable")
 
     gen_args = argparse.ArgumentParser(add_help=False)
@@ -529,7 +556,7 @@ def main():
 
     learn_args = argparse.ArgumentParser(add_help=False)
     learn_args.add_argument("--lr", type=float, default=2e-4)
-    learn_args.add_argument("--new-frac", type=float, default=0.5, help="share of batches from the new text (rest = replay)")
+    learn_args.add_argument("--new-frac", type=float, default=0.5, help="share of examples from the new text (rest = replay)")
     learn_args.add_argument("--max-forget", type=float, default=0.25, help="revert if old-data loss rises more than this")
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -568,7 +595,7 @@ def main():
     a = p.parse_args()
     torch.manual_seed(a.seed)
     random.seed(a.seed)
-    torch.set_num_threads(a.threads or max(1, (os.cpu_count() or 2) // 2))
+    torch.set_num_threads(a.threads or min(4, max(1, (os.cpu_count() or 2) // 2)))
     if a.low_priority:
         lower_priority()
     a.fn(a)
