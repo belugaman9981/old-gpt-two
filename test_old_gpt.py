@@ -35,7 +35,7 @@ class LossModel(nn.Module):
 
 
 class LearningTests(unittest.TestCase):
-     def test_repetition_penalty_changes_seen_logits(self):
+    def test_repetition_penalty_changes_seen_logits(self):
         logits = torch.tensor([[2.0, -2.0, 1.0]])
         ids = torch.tensor([[0, 1, 1]])
         adjusted = gpt.penalize_repetition(logits, ids, 2.0, 0.5)
